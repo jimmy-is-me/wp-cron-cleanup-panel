@@ -2,8 +2,8 @@
 /*
 Plugin Name: Cron Cleanup Panel
 Plugin URI:  https://github.com/jimmy-is-me/wp-cron-cleanup-panel
-Description: WordPress admin panel to inspect and delete orphaned WP-Cron and Action Scheduler jobs. Includes memory usage, large option detection, large file scanner, stuck job detection, and CPU/RAM pressure analysis.
-Version:     1.2.2
+Description: WordPress admin panel to inspect and delete WP-Cron and Action Scheduler jobs. Includes memory usage, large option detection, large file scanner, stuck job detection, and CPU/RAM pressure analysis.
+Version:     1.2.3
 Author:      jimmy-is-me
 License:     MIT
 */
@@ -14,13 +14,38 @@ class Cron_Cleanup_Panel {
 
 	private array  $targets = [ 'thumbpress', 'image-sizes', 'optimize_img' ];
 	private string $page    = 'cron-cleanup-panel';
-	private int    $stuck_threshold = 600;
+	private int    $stuck_threshold    = 600;
+	private int    $cron_overdue_days  = 7;
+
+	// ─── Hook 中文附註：hook 關鍵字 => [說明, 重要性]  important: high/medium/low ───
+	private array $hook_hints = [
+		// WooCommerce
+		'woocommerce'                  => [ '🛒 WooCommerce 核心排程（訂單、Session、快取）', 'medium' ],
+		'wc_'                          => [ '🛒 WooCommerce 輔助任務', 'medium' ],
+		// Google Listings & Ads (GLA)
+		'gla/'                         => [ '📢 Google Listings & Ads 同步任務（商品/廣告）', 'high' ],
+		'gla_'                         => [ '📢 Google Listings & Ads 輔助任務', 'medium' ],
+		// Rocket / 快取
+		'rocket'                       => [ '🚀 WP Rocket 預載/快取任務（high total 時可能拖慢 CPU）', 'high' ],
+		// Action Scheduler 自身
+		'action_scheduler'             => [ '⚙️ Action Scheduler 自我維護排程', 'low' ],
+		// WP-Cron 自身
+		'wp_'                          => [ '🔧 WordPress 核心內建排程', 'low' ],
+		// Yoast
+		'wpseo'                        => [ '🔍 Yoast SEO 排程任務', 'low' ],
+		// WP Cron Management
+		'wmp_cron'                     => [ '⏱ WP Cron 管理外掛排程', 'low' ],
+		// Targets
+		'thumbpress'                   => [ '🖼 ThumbPress 圖片處理（target）', 'high' ],
+		'image-sizes'                  => [ '🖼 圖片尺寸重建任務（target）', 'high' ],
+		'optimize_img'                 => [ '🖼 圖片優化任務（target）', 'high' ],
+	];
 
 	public function __construct() {
-		add_action( 'admin_menu',                        [ $this, 'register_menu' ] );
-		add_action( 'admin_post_ccp_delete_all',         [ $this, 'handle_delete_all' ] );
-		add_action( 'admin_post_ccp_delete_single',      [ $this, 'handle_delete_single' ] );
-		add_action( 'admin_post_ccp_delete_hook_as',     [ $this, 'handle_delete_hook_as' ] );
+		add_action( 'admin_menu',                    [ $this, 'register_menu' ] );
+		add_action( 'admin_post_ccp_delete_all',     [ $this, 'handle_delete_all' ] );
+		add_action( 'admin_post_ccp_delete_single',  [ $this, 'handle_delete_single' ] );
+		add_action( 'admin_post_ccp_delete_hook_as', [ $this, 'handle_delete_hook_as' ] );
 	}
 
 	// ─── Menu ─────────────────────────────────────────────────────────────────
@@ -41,6 +66,15 @@ class Cron_Cleanup_Panel {
 			if ( stripos( $hook, $t ) !== false ) return true;
 		}
 		return false;
+	}
+
+	private function get_hook_hint( string $hook ): array {
+		foreach ( $this->hook_hints as $keyword => $info ) {
+			if ( stripos( $hook, $keyword ) !== false ) {
+				return $info; // [ label, importance ]
+			}
+		}
+		return [ '❓ 未知來源外掛排程', 'low' ];
 	}
 
 	private function nonce_url( array $args ): string {
@@ -67,6 +101,17 @@ class Cron_Cleanup_Panel {
 		];
 		$style = $map[ $status ] ?? 'background:#eee;color:#333';
 		return '<span style="padding:2px 7px;border-radius:3px;font-size:11px;' . $style . '">' . esc_html( $status ) . '</span>';
+	}
+
+	private function importance_badge( string $level ): string {
+		$map = [
+			'high'   => 'background:#d9534f;color:#fff',
+			'medium' => 'background:#f0ad4e;color:#fff',
+			'low'    => 'background:#aaa;color:#fff',
+		];
+		$label = [ 'high' => '⚠️ 高', 'medium' => '🔶 中', 'low' => '🔵 低' ];
+		$style = $map[ $level ] ?? 'background:#eee;color:#333';
+		return '<span style="padding:2px 6px;border-radius:3px;font-size:11px;' . $style . '">' . ( $label[ $level ] ?? $level ) . '</span>';
 	}
 
 	// ─── Data: WP-Cron ────────────────────────────────────────────────────────
@@ -181,6 +226,17 @@ class Cron_Cleanup_Panel {
 
 	// ─── Data: CPU / RAM Pressure ─────────────────────────────────────────────
 
+	/**
+	 * 計算每個 AS hotspot 的「壓力分數」
+	 * score = total * 1 + failed_cnt * 3 + running_cnt * 5
+	 * 分數愈高 = 愈可能是 CPU / RAM 的根源
+	 */
+	private function calc_pressure_score( array $r ): int {
+		return (int) $r['total'] * 1
+			+ (int) $r['failed_cnt'] * 3
+			+ (int) $r['running_cnt'] * 5;
+	}
+
 	private function get_pressure_report(): array {
 		global $wpdb;
 		$report = [];
@@ -200,12 +256,14 @@ class Cron_Cleanup_Panel {
 
 		// 2. AS hotspots
 		$as_table = $this->as_table();
-		$report['as_hotspots'] = [];
-		$report['as_stuck']    = [];
-		$report['as_failing']  = [];
+		$report['as_hotspots']       = [];
+		$report['as_hotspots_top5']  = [];
+		$report['as_stuck']          = [];
+		$report['as_failing']        = [];
+		$report['as_top5_running']   = [];
 
 		if ( $as_table ) {
-			$report['as_hotspots'] = $wpdb->get_results(
+			$hotspots = $wpdb->get_results(
 				"SELECT hook,
 				        COUNT(*) AS total,
 				        SUM(attempts) AS total_attempts,
@@ -215,10 +273,35 @@ class Cron_Cleanup_Panel {
 				 FROM {$as_table}
 				 GROUP BY hook
 				 ORDER BY total DESC
-				 LIMIT 20",
+				 LIMIT 50",
 				ARRAY_A
 			) ?: [];
 
+			// 加入壓力分數 & hint
+			foreach ( $hotspots as &$h ) {
+				$h['pressure_score'] = $this->calc_pressure_score( $h );
+				[ $h['hint'], $h['importance'] ] = $this->get_hook_hint( $h['hook'] );
+			}
+			unset( $h );
+
+			$report['as_hotspots'] = $hotspots;
+
+			// Top 5 壓力最高
+			$sorted = $hotspots;
+			usort( $sorted, fn( $a, $b ) => $b['pressure_score'] <=> $a['pressure_score'] );
+			$report['as_hotspots_top5'] = array_slice( $sorted, 0, 5 );
+
+			// Top 5 目前持續在跑（in-progress）
+			$report['as_top5_running'] = $wpdb->get_results(
+				"SELECT action_id, hook, scheduled_date_gmt, last_attempt_gmt, attempts
+				 FROM {$as_table}
+				 WHERE status = 'in-progress'
+				 ORDER BY last_attempt_gmt DESC
+				 LIMIT 5",
+				ARRAY_A
+			) ?: [];
+
+			// Stuck jobs
 			$stuck_ts = gmdate( 'Y-m-d H:i:s', time() - $this->stuck_threshold );
 			$report['as_stuck'] = $wpdb->get_results(
 				$wpdb->prepare(
@@ -231,6 +314,7 @@ class Cron_Cleanup_Panel {
 				), ARRAY_A
 			) ?: [];
 
+			// Repeatedly failing
 			$report['as_failing'] = $wpdb->get_results(
 				"SELECT action_id, hook, attempts, last_attempt_gmt
 				 FROM {$as_table}
@@ -240,13 +324,14 @@ class Cron_Cleanup_Panel {
 			) ?: [];
 		}
 
-		// 3. WP-Cron overdue (超過 stuck_threshold)
+		// 3. WP-Cron overdue（超過 7 天）
 		$crons   = _get_cron_array();
 		$overdue = [];
 		$now     = time();
+		$threshold_sec = $this->cron_overdue_days * DAY_IN_SECONDS;
 		if ( is_array( $crons ) ) {
 			foreach ( $crons as $ts => $events ) {
-				if ( $now - (int) $ts < $this->stuck_threshold ) continue;
+				if ( $now - (int) $ts < $threshold_sec ) continue;
 				foreach ( $events as $hook => $args_list ) {
 					$overdue[ $hook ] = ( $overdue[ $hook ] ?? 0 ) + count( $args_list );
 				}
@@ -330,10 +415,6 @@ class Cron_Cleanup_Panel {
 		$this->redirect( [ 'deleted' => $deleted ] );
 	}
 
-	/**
-	 * 刪除 Action Scheduler 中指定 hook 的「所有」任務
-	 * 用於 Hotspots 區塊的 Delete All by Hook
-	 */
 	public function handle_delete_hook_as(): void {
 		$this->check_auth();
 		global $wpdb;
@@ -375,7 +456,7 @@ class Cron_Cleanup_Panel {
 		];
 		?>
 		<div class="wrap">
-		<h1>⚙️ Cron Cleanup Panel <span style="font-size:13px;font-weight:normal;color:#888">v1.2.2</span></h1>
+		<h1>⚙️ Cron Cleanup Panel <span style="font-size:13px;font-weight:normal;color:#888">v1.2.3</span></h1>
 
 		<?php if ( isset( $_GET['cron_removed'] ) || isset( $_GET['as_removed'] ) || isset( $_GET['deleted'] ) ) : ?>
 			<div class="notice notice-success is-dismissible"><p>
@@ -391,6 +472,7 @@ class Cron_Cleanup_Panel {
 			</p></div>
 		<?php endif; ?>
 
+		<?php $this->section_sysinfo(); ?>
 		<?php $this->section_memory( $mem ); ?>
 		<?php $this->section_pressure( $pressure ); ?>
 		<?php $this->section_delete_all(); ?>
@@ -404,13 +486,38 @@ class Cron_Cleanup_Panel {
 
 	// ─── Sections ─────────────────────────────────────────────────────────────
 
+	private function section_sysinfo(): void {
+		$tz_string = wp_timezone_string();
+		$tz        = wp_timezone();
+		$now_local = new DateTime( 'now', $tz );
+		$now_gmt   = new DateTime( 'now', new DateTimeZone( 'UTC' ) );
+		$offset    = $now_local->format( 'P' );
+		?>
+		<h2>🖥 系統資訊</h2>
+		<table class="widefat striped" style="max-width:640px">
+			<tbody>
+				<tr><th width="160">PHP 版本</th><td><?php echo esc_html( PHP_VERSION ); ?></td></tr>
+				<tr><th>WordPress 版本</th><td><?php echo esc_html( get_bloginfo( 'version' ) ); ?></td></tr>
+				<tr><th>網站時區</th><td>
+					<strong><?php echo esc_html( $tz_string ); ?></strong>
+					（UTC <?php echo esc_html( $offset ); ?>）
+				</td></tr>
+				<tr><th>本地時間</th><td><?php echo esc_html( $now_local->format( 'Y-m-d H:i:s' ) ); ?></td></tr>
+				<tr><th>GMT 時間</th><td><?php echo esc_html( $now_gmt->format( 'Y-m-d H:i:s' ) ); ?></td></tr>
+				<tr><th>伺服器 OS</th><td><?php echo esc_html( php_uname( 's' ) . ' ' . php_uname( 'r' ) ); ?></td></tr>
+				<tr><th>DB 版本</th><td><?php global $wpdb; echo esc_html( $wpdb->db_version() ); ?></td></tr>
+			</tbody>
+		</table>
+		<?php
+	}
+
 	private function section_memory( array $mem ): void {
 		$limit_bytes = wp_convert_hr_to_bytes( $mem['limit'] );
 		$curr_bytes  = memory_get_usage( true );
 		$pct         = $limit_bytes > 0 ? round( $curr_bytes / $limit_bytes * 100 ) : 0;
 		$bar_color   = $pct >= 80 ? '#d9534f' : ( $pct >= 60 ? '#f0ad4e' : '#5cb85c' );
 		?>
-		<h2>📊 Memory Usage</h2>
+		<h2 style="margin-top:28px">📊 Memory Usage</h2>
 		<table class="widefat striped" style="max-width:520px">
 			<tbody>
 				<tr><th width="120">Current</th><td><?php echo esc_html( $mem['current'] ); ?> (<?php echo $pct; ?>%)
@@ -428,7 +535,74 @@ class Cron_Cleanup_Panel {
 	private function section_pressure( array $p ): void { ?>
 		<h2 style="margin-top:28px">🔥 CPU / RAM Pressure Analysis</h2>
 
-		<h3>Autoload Options Total</h3>
+		<?php if ( ! empty( $p['as_hotspots_top5'] ) ) : ?>
+		<h3>🎯 智能分析：最可能造成 CPU / RAM 壓力的前 5 個 Hook</h3>
+		<p style="color:#555">壓力分數 = total × 1 + failed × 3 + running × 5，分數愈高代表愈需要優先處理。</p>
+		<table class="widefat" style="border-left:4px solid #d9534f">
+			<thead style="background:#f8d7da">
+				<tr>
+					<th>#</th>
+					<th>Hook</th>
+					<th>說明</th>
+					<th>重要性</th>
+					<th>壓力分數</th>
+					<th>Total</th>
+					<th>Running</th>
+					<th>Failed</th>
+					<th>Action</th>
+				</tr>
+			</thead>
+			<tbody>
+			<?php foreach ( $p['as_hotspots_top5'] as $i => $r ) :
+				[ $hint, $importance ] = $this->get_hook_hint( $r['hook'] );
+			?>
+				<tr style="background:<?php echo $i === 0 ? '#f8d7da' : ( $i === 1 ? '#fff3cd' : '#fff' ); ?>">
+					<td><strong><?php echo $i + 1; ?></strong></td>
+					<td><code style="font-size:12px"><?php echo esc_html( $r['hook'] ); ?></code></td>
+					<td style="font-size:12px;color:#555"><?php echo esc_html( $hint ); ?></td>
+					<td><?php echo $this->importance_badge( $importance ); ?></td>
+					<td><strong><?php echo (int) $r['pressure_score']; ?></strong></td>
+					<td><?php echo (int) $r['total']; ?></td>
+					<td><?php echo (int) $r['running_cnt'] > 0 ? '<strong style="color:#d9534f">' . (int) $r['running_cnt'] . '</strong>' : '0'; ?></td>
+					<td><?php echo (int) $r['failed_cnt'] > 0 ? '<strong style="color:#c9302c">' . (int) $r['failed_cnt'] . '</strong>' : '0'; ?></td>
+					<td>
+						<a class="button button-small"
+						   style="color:#fff;background:#d9534f;border-color:#d43f3a"
+						   onclick="return confirm('刪除「<?php echo esc_js( $r['hook'] ); ?>」的所有 <?php echo (int) $r['total']; ?> 筆任務？此操作不可復原。')"
+						   href="<?php echo $this->nonce_url( [ 'action' => 'ccp_delete_hook_as', 'hook' => $r['hook'] ] ); ?>">
+							Delete All (<?php echo (int) $r['total']; ?>)
+						</a>
+					</td>
+				</tr>
+			<?php endforeach; ?>
+			</tbody>
+		</table>
+		<?php endif; ?>
+
+		<?php if ( ! empty( $p['as_top5_running'] ) ) : ?>
+		<h3 style="margin-top:20px">⚡ 前 5 個目前持續在執行的進程（in-progress）</h3>
+		<p style="color:#555">這些任務目前正在執行中，若長時間不結束即為 Stuck Job，是 CPU 佔用最直接的來源。</p>
+		<table class="widefat striped">
+			<thead><tr><th>#</th><th>ID</th><th>Hook</th><th>說明</th><th>Scheduled (GMT)</th><th>Last Attempt (GMT)</th><th>Attempts</th></tr></thead>
+			<tbody>
+			<?php foreach ( $p['as_top5_running'] as $i => $r ) :
+				[ $hint ] = $this->get_hook_hint( $r['hook'] );
+			?>
+				<tr style="background:#f8d7da">
+					<td><strong><?php echo $i + 1; ?></strong></td>
+					<td><?php echo (int) $r['action_id']; ?></td>
+					<td><code style="font-size:12px"><?php echo esc_html( $r['hook'] ); ?></code></td>
+					<td style="font-size:12px;color:#555"><?php echo esc_html( $hint ); ?></td>
+					<td><?php echo esc_html( $r['scheduled_date_gmt'] ); ?></td>
+					<td><?php echo esc_html( $r['last_attempt_gmt'] ); ?></td>
+					<td><?php echo (int) $r['attempts']; ?></td>
+				</tr>
+			<?php endforeach; ?>
+			</tbody>
+		</table>
+		<?php endif; ?>
+
+		<h3 style="margin-top:24px">Autoload Options Total</h3>
 		<p>每次 WordPress 啟動都會載入所有 autoload option，總大小愈大代表啟動記憶體消耗愈多。</p>
 		<p><strong><?php echo esc_html( $p['autoload_total'] ); ?></strong></p>
 
@@ -454,6 +628,9 @@ class Cron_Cleanup_Panel {
 			<thead>
 				<tr>
 					<th>Hook</th>
+					<th>說明</th>
+					<th>重要性</th>
+					<th>壓力分</th>
 					<th>Total</th>
 					<th>Pending</th>
 					<th>Running</th>
@@ -464,28 +641,25 @@ class Cron_Cleanup_Panel {
 			</thead>
 			<tbody>
 			<?php foreach ( $p['as_hotspots'] as $r ) :
-				$is_hot = ( (int) $r['running_cnt'] > 0 || (int) $r['failed_cnt'] > 5 );
+				$is_hot    = ( (int) $r['running_cnt'] > 0 || (int) $r['failed_cnt'] > 5 );
 				$row_style = $is_hot ? 'background:#fff3cd' : '';
+				[ $hint, $importance ] = $this->get_hook_hint( $r['hook'] );
 			?>
 				<tr style="<?php echo $row_style; ?>">
-					<td><code><?php echo esc_html( $r['hook'] ); ?></code></td>
+					<td><code style="font-size:12px"><?php echo esc_html( $r['hook'] ); ?></code></td>
+					<td style="font-size:12px;color:#555"><?php echo esc_html( $hint ); ?></td>
+					<td><?php echo $this->importance_badge( $importance ); ?></td>
+					<td><?php echo (int) $r['pressure_score']; ?></td>
 					<td><?php echo (int) $r['total']; ?></td>
 					<td><?php echo (int) $r['pending_cnt']; ?></td>
-					<td><?php echo (int) $r['running_cnt'] > 0
-						? '<strong style="color:#d9534f">' . (int) $r['running_cnt'] . '</strong>'
-						: '0'; ?></td>
-					<td><?php echo (int) $r['failed_cnt'] > 0
-						? '<strong style="color:#c9302c">' . (int) $r['failed_cnt'] . '</strong>'
-						: '0'; ?></td>
+					<td><?php echo (int) $r['running_cnt'] > 0 ? '<strong style="color:#d9534f">' . (int) $r['running_cnt'] . '</strong>' : '0'; ?></td>
+					<td><?php echo (int) $r['failed_cnt'] > 0 ? '<strong style="color:#c9302c">' . (int) $r['failed_cnt'] . '</strong>' : '0'; ?></td>
 					<td><?php echo (int) $r['total_attempts']; ?></td>
 					<td>
 						<a class="button button-small"
 						   style="<?php echo $is_hot ? 'color:#fff;background:#d9534f;border-color:#d43f3a' : ''; ?>"
-						   onclick="return confirm('刪除 hook「<?php echo esc_js( $r['hook'] ); ?>」的所有 <?php echo (int) $r['total']; ?> 筆 Action Scheduler 任務？此操作不可復原。')"
-						   href="<?php echo $this->nonce_url( [
-							   'action' => 'ccp_delete_hook_as',
-							   'hook'   => $r['hook'],
-						   ] ); ?>">
+						   onclick="return confirm('刪除「<?php echo esc_js( $r['hook'] ); ?>」所有 <?php echo (int) $r['total']; ?> 筆任務？此操作不可復原。')"
+						   href="<?php echo $this->nonce_url( [ 'action' => 'ccp_delete_hook_as', 'hook' => $r['hook'] ] ); ?>">
 							Delete All (<?php echo (int) $r['total']; ?>)
 						</a>
 					</td>
@@ -498,12 +672,15 @@ class Cron_Cleanup_Panel {
 		<?php if ( ! empty( $p['as_stuck'] ) ) : ?>
 		<h3 style="margin-top:20px">⚠️ Stuck Jobs（in-progress > <?php echo (int) ( $this->stuck_threshold / 60 ); ?> 分鐘）</h3>
 		<table class="widefat striped">
-			<thead><tr><th>ID</th><th>Hook</th><th>Last Attempt (GMT)</th><th>Attempts</th></tr></thead>
+			<thead><tr><th>ID</th><th>Hook</th><th>說明</th><th>Last Attempt (GMT)</th><th>Attempts</th></tr></thead>
 			<tbody>
-			<?php foreach ( $p['as_stuck'] as $r ) : ?>
+			<?php foreach ( $p['as_stuck'] as $r ) :
+				[ $hint ] = $this->get_hook_hint( $r['hook'] );
+			?>
 				<tr style="background:#f8d7da">
 					<td><?php echo (int) $r['action_id']; ?></td>
 					<td><code><?php echo esc_html( $r['hook'] ); ?></code></td>
+					<td style="font-size:12px;color:#555"><?php echo esc_html( $hint ); ?></td>
 					<td><?php echo esc_html( $r['last_attempt_gmt'] ); ?></td>
 					<td><?php echo (int) $r['attempts']; ?></td>
 				</tr>
@@ -515,12 +692,15 @@ class Cron_Cleanup_Panel {
 		<?php if ( ! empty( $p['as_failing'] ) ) : ?>
 		<h3 style="margin-top:20px">❌ Repeatedly Failing Jobs（attempts > 3）</h3>
 		<table class="widefat striped">
-			<thead><tr><th>ID</th><th>Hook</th><th>Attempts</th><th>Last Attempt (GMT)</th></tr></thead>
+			<thead><tr><th>ID</th><th>Hook</th><th>說明</th><th>Attempts</th><th>Last Attempt (GMT)</th></tr></thead>
 			<tbody>
-			<?php foreach ( $p['as_failing'] as $r ) : ?>
+			<?php foreach ( $p['as_failing'] as $r ) :
+				[ $hint ] = $this->get_hook_hint( $r['hook'] );
+			?>
 				<tr style="background:#fff3cd">
 					<td><?php echo (int) $r['action_id']; ?></td>
 					<td><code><?php echo esc_html( $r['hook'] ); ?></code></td>
+					<td style="font-size:12px;color:#555"><?php echo esc_html( $hint ); ?></td>
 					<td><strong><?php echo (int) $r['attempts']; ?></strong></td>
 					<td><?php echo esc_html( $r['last_attempt_gmt'] ); ?></td>
 				</tr>
@@ -530,7 +710,7 @@ class Cron_Cleanup_Panel {
 		<?php endif; ?>
 
 		<?php if ( ! empty( $p['cron_overdue'] ) ) : ?>
-		<h3 style="margin-top:20px">⏳ WP-Cron Overdue（積壓超過 <?php echo (int) ( $this->stuck_threshold / 60 ); ?> 分鐘未執行）</h3>
+		<h3 style="margin-top:20px">⏳ WP-Cron Overdue（積壓超過 <?php echo (int) $this->cron_overdue_days; ?> 天未執行）</h3>
 		<table class="widefat striped">
 			<thead><tr><th>Hook</th><th>Count</th></tr></thead>
 			<tbody>
