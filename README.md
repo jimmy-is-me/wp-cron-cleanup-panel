@@ -1,6 +1,6 @@
 # WP Cron Cleanup Panel
 
-A lightweight WordPress MU-Plugin that adds a dedicated admin panel for inspecting and deleting orphaned WP-Cron events and Action Scheduler jobs — with bonus memory usage tracking, large option detection, and large file scanning.
+A lightweight WordPress MU-Plugin that adds a dedicated admin panel for inspecting and deleting orphaned WP-Cron events and Action Scheduler jobs — with memory usage tracking, CPU/RAM pressure analysis, stuck/looping job detection, large option detection, and large file scanning.
 
 > Originally built to solve a **ThumbPress / image-sizes runaway cron loop** causing 130%+ CPU on a multi-site Docker server.
 
@@ -10,12 +10,13 @@ A lightweight WordPress MU-Plugin that adds a dedicated admin panel for inspecti
 
 | Feature | Description |
 |---|---|
-| ⏰ WP-Cron Inspector | List and delete orphaned cron events by hook name |
-| 📋 Action Scheduler Inspector | List and delete pending/running AS jobs by hook |
+| ⏰ WP-Cron Inspector | List and delete matched cron events; highlights overdue/stuck jobs |
+| 📋 Action Scheduler Inspector | List and delete matched AS jobs; shows stuck and looping status |
+| 🔥 CPU / RAM Pressure Analysis | Autoload option total size, AS hotspots by hook, stuck jobs, repeatedly failing jobs, WP-Cron overdue summary |
+| 📊 Memory Usage | Current, peak, PHP limit with visual bar |
 | 🗑 Delete All | One-click delete all matched jobs across both systems |
-| 📊 Memory Usage | Current, peak, and PHP memory limit |
 | 🗃 Large Options | Lists `wp_options` rows larger than 10 KB |
-| 📁 Large Files | Scans uploads, plugins, themes for files > 5 MB with full path |
+| 📁 Large Files | Scans uploads/plugins/themes for files > 5 MB — shows **full server path**, top 20 only |
 
 ---
 
@@ -23,24 +24,23 @@ A lightweight WordPress MU-Plugin that adds a dedicated admin panel for inspecti
 
 ### Method 1: MU-Plugin (Recommended)
 
-1. Copy `cron-cleanup-panel.php` to your `wp-content/mu-plugins/` folder.
-2. If the folder doesn't exist, create it.
-3. The panel activates automatically — no activation step needed.
-
 ```bash
 cp cron-cleanup-panel.php /path/to/wp-content/mu-plugins/
 ```
+
+If `mu-plugins` doesn't exist, create it. The panel activates automatically — no activation step needed.
 
 ### Method 2: Docker Container
 
 ```bash
 docker cp cron-cleanup-panel.php orangecitytw-php-1:/var/www/html/wp-content/mu-plugins/
+# Repeat for other sites
+docker cp cron-cleanup-panel.php yilanmartcom-php-1:/var/www/html/wp-content/mu-plugins/
 ```
 
 ### Method 3: Regular Plugin
 
-1. Copy `cron-cleanup-panel.php` to `wp-content/plugins/cron-cleanup-panel/`.
-2. Activate via **Plugins > Installed Plugins**.
+Copy to `wp-content/plugins/cron-cleanup-panel/` and activate via **Plugins > Installed Plugins**.
 
 ---
 
@@ -48,43 +48,61 @@ docker cp cron-cleanup-panel.php orangecitytw-php-1:/var/www/html/wp-content/mu-
 
 1. Log in to **WordPress Admin**.
 2. Click **Cron Cleanup** in the left sidebar.
-3. The panel shows:
-   - Current PHP memory usage.
-   - All matching WP-Cron events (by target hook keywords).
-   - All matching Action Scheduler jobs.
-   - Large `wp_options` rows (garbage data indicator).
-   - Large files in uploads / plugins / themes with full server paths.
-4. Use **Delete All Related Jobs** to bulk-remove, or delete individual rows.
+3. Review sections top-to-bottom:
+   - **Memory Usage** — visual bar shows current PHP memory pressure.
+   - **CPU / RAM Pressure Analysis** — autoload bloat, AS hotspots, stuck jobs, failing jobs, overdue WP-Cron.
+   - **WP-Cron Events** — matched events with overdue indicator (yellow = stuck).
+   - **Action Scheduler** — matched events with status badges; red = stuck, yellow = looping.
+   - **Large Options** — garbage data in `wp_options`.
+   - **Large Files** — top 20 heaviest files with full path.
+4. Use **Delete All Related Jobs** to bulk-remove, or delete individual rows inline.
 
 ---
 
 ## Configuration
 
-The target hook keywords are defined at the top of the class. Edit them to match your use case:
+**Target hook keywords** — edit to match your use case:
 
 ```php
 private array $targets = [ 'thumbpress', 'image-sizes', 'optimize_img' ];
 ```
 
-To scan different directories or change the large file threshold, edit `get_large_files()`:
+**Stuck threshold** — jobs running longer than this (seconds) are flagged as stuck:
 
 ```php
-private function get_large_files( int $min_mb = 5, int $limit = 30 ): array {
+private int $stuck_threshold = 600; // 10 minutes
 ```
 
-To change the large option threshold (default 10 KB), edit `get_large_options()`:
+**Large file threshold / limit:**
 
 ```php
-private function get_large_options( int $threshold = 10240 ): array {
+private function get_large_files( int $min_mb = 5, int $limit = 20 ): array
 ```
+
+**Large option threshold:**
+
+```php
+private function get_large_options( int $threshold = 10240 ): array // 10 KB
+```
+
+---
+
+## Color Legend
+
+| Color | Meaning |
+|---|---|
+| 🔴 Red row | Stuck job (in-progress > 10 min) |
+| 🟡 Yellow row | Looping / overdue job |
+| 🟢 Green | OK |
+| Status badge | `pending` / `in-progress` / `complete` / `failed` / `canceled` |
 
 ---
 
 ## Security
 
-- Only accessible to users with `manage_options` capability (Administrators).
-- All delete actions are protected by WordPress nonces (`wp_nonce_url` / `check_admin_referer`).
-- No data is exposed publicly — the panel is only visible in `wp-admin`.
+- Only accessible to `manage_options` capability (Administrators).
+- All delete actions protected by WordPress nonces.
+- No data exposed publicly.
 
 ---
 
@@ -99,16 +117,30 @@ private function get_large_options( int $threshold = 10240 ): array {
 
 ---
 
+## Changelog
+
+### v1.2.0
+- Large Files limited to top 20
+- WP-Cron overdue detection (highlights jobs stuck past threshold)
+- Action Scheduler stuck (in-progress > 10 min) and looping (attempts > 3) detection
+- CPU/RAM Pressure section: autoload total, AS hotspots aggregated by hook, stuck jobs, repeatedly failing jobs, WP-Cron overdue summary
+- Memory bar visualization
+- Status badges for AS events
+
+### v1.1.0
+- Initial release with cron cleanup, large option/file scanning, memory display
+
+---
+
 ## Background
 
-This tool was built after diagnosing a production server where:
+Built after diagnosing a production server where:
 
-- `orangecitytw-php-1` was hitting **134% CPU**
-- `yilanmartcom-php-1` was hitting **136% CPU**
-- MySQL was at **131% CPU** being dragged by PHP workers
-- Root cause: **ThumbPress `thumbpress_optimize_img` hooks stacking up** in both WP-Cron and Action Scheduler, with 45+ orphaned events that couldn't be deleted from the standard Scheduled Actions UI
+- `orangecitytw-php-1` → **134% CPU**
+- `yilanmartcom-php-1` → **136% CPU**
+- MySQL → **131% CPU** (dragged by PHP workers)
 
-Standard approaches (WP Crontrol, Action Scheduler UI) couldn't handle the volume. This panel provides direct database-level cleanup with a safe, nonce-protected interface.
+Root cause: **ThumbPress `thumbpress_optimize_img` hooks stacking up** in both WP-Cron and Action Scheduler, with 45+ orphaned events that couldn't be deleted from the standard Scheduled Actions UI.
 
 ---
 
